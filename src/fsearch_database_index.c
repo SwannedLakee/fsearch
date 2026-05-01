@@ -944,6 +944,7 @@ fsearch_database_index_scan(FsearchDatabaseIndex *self, GCancellable *cancellabl
                         cancellable,
                         scan_status_cb,
                         self)) {
+        fsearch_database_index_start_polling(self);
         return false;
     }
 

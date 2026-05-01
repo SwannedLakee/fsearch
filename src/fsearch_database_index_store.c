@@ -692,9 +692,7 @@ fsearch_database_index_store_start(FsearchDatabaseIndexStore *store, GCancellabl
                                                                            store->monitor.ctx,
                                                                            index_store_index_event_cb,
                                                                            store);
-        if (!fsearch_database_index_scan(index, cancellable)) {
-            fsearch_database_index_start_polling(index);
-        }
+        fsearch_database_index_scan(index, cancellable);
         g_ptr_array_add(indices, g_steal_pointer(&index));
     }
     if (g_cancellable_is_cancelled(cancellable)) {
