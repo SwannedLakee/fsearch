@@ -6,7 +6,9 @@
 #include "fsearch_database_entry.h"
 #include "fsearch_database_entry_info.h"
 #include "fsearch_database_file.h"
+#include "fsearch_database_include.h"
 #include "fsearch_database_include_manager.h"
+#include "fsearch_database_index.h"
 #include "fsearch_database_index_store.h"
 #include "fsearch_database_index_properties.h"
 #include "fsearch_database_info.h"
@@ -30,6 +32,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <glib/gi18n.h>
 
 struct _FsearchDatabase {
     GObject parent_instance;
@@ -448,21 +451,38 @@ database_save(FsearchDatabase *self) {
 }
 
 void
-scan_thread_cb(gpointer data, gpointer user_data) {
-    FsearchDatabaseIndexStore *store = data;
+io_thread_cb(gpointer data, gpointer user_data) {
+    FsearchDatabaseWork *work = data;
     FsearchDatabase *db = user_data;
-    g_return_if_fail(store);
+    g_return_if_fail(work);
     g_return_if_fail(db);
 
-    fsearch_database_index_store_start(store, db->cancellable);
-    if (!g_cancellable_is_cancelled(db->cancellable)) {
-        g_autoptr(FsearchDatabaseWork) finished_work = fsearch_database_work_new_scan_finished(
-            store,
-            (void *(*)(void *))fsearch_database_index_store_ref,
-            (GDestroyNotify)fsearch_database_index_store_unref);
-        fsearch_database_queue_work(db, finished_work);
+    bool queue_work = false;
+
+    FsearchDatabaseWorkKind kind = fsearch_database_work_get_kind(work);
+    switch (kind) {
+    case FSEARCH_DATABASE_WORK_SCAN_FINISHED: {
+        g_autoptr(FsearchDatabaseIndexStore) store = fsearch_database_work_scan_finished_get_index_store(work);
+        fsearch_database_index_store_start(store, db->cancellable);
+        queue_work = true;
+        break;
     }
-    g_clear_pointer(&store, fsearch_database_index_store_unref);
+    case FSEARCH_DATABASE_WORK_RESCAN_INDEX_FINISHED: {
+        g_autoptr(FsearchDatabaseIndex) new_index = fsearch_database_work_rescan_index_finished_get_index(work);
+        if (!fsearch_database_index_scan(new_index, db->cancellable)) {
+            g_debug("[db] index rescan failed for index %u",
+                    fsearch_database_index_get_id(new_index));
+            break;
+        }
+        queue_work = true;
+        break;
+    }
+    default:
+        g_assert_not_reached();
+    }
+    if (queue_work && !g_cancellable_is_cancelled(db->cancellable)) {
+        fsearch_database_queue_work(db, work);
+    }
 }
 
 static void
@@ -542,7 +562,72 @@ database_rescan(FsearchDatabase *self) {
         self);
     g_return_if_fail(store);
 
-    g_thread_pool_push(self->io_pool, g_steal_pointer(&store), NULL);
+    // The IO thread is expecting work objects -> use scan_finished kind to wrap the index store
+    g_autoptr(FsearchDatabaseWork) work = fsearch_database_work_new_scan_finished(
+        store,
+        (void *(*)(void *))fsearch_database_index_store_ref,
+        (GDestroyNotify)fsearch_database_index_store_unref);
+
+    g_thread_pool_push(self->io_pool, g_steal_pointer(&work), NULL);
+}
+
+static void
+database_rescan_index(FsearchDatabase *self, FsearchDatabaseWork *work) {
+    // DB must be locked
+    g_return_if_fail(self);
+    g_return_if_fail(self->store);
+    g_return_if_fail(work);
+
+    const uint32_t index_id = fsearch_database_work_rescan_index_get_id(work);
+
+    g_autoptr(FsearchDatabaseIndex) new_index =
+        fsearch_database_index_store_create_index_for_rescan(self->store, index_id);
+
+    if (!new_index) {
+        g_warning("[db] rescan_index: failed to create index for rescan (id=%u)", index_id);
+        return;
+    }
+
+    signal_emit0(self, SIGNAL_SCAN_STARTED);
+
+    // Push to the IO pool to perform the actual scan
+    g_autoptr(FsearchDatabaseWork) new_work = fsearch_database_work_new_rescan_index_finished(new_index);
+    g_thread_pool_push(self->io_pool, g_steal_pointer(&new_work), NULL);
+}
+
+static void
+database_rescan_index_finished(FsearchDatabase *self, FsearchDatabaseWork *work) {
+    // DB must be locked
+    g_return_if_fail(self);
+    g_return_if_fail(work);
+
+    g_autoptr(FsearchDatabaseIndex) new_index =
+        fsearch_database_work_rescan_index_finished_get_index(work);
+
+    if (!self->store) {
+        // The store was fully replaced by a concurrent full rescan - nothing to do.
+        return;
+    }
+    signal_emit_database_progress(self, g_strdup(_("Index rescan: applying changes…")));
+
+    if (!fsearch_database_index_store_replace_index(self->store, new_index)) {
+        return;
+    }
+
+#ifdef HAVE_MALLOC_TRIM
+    malloc_trim(0);
+#endif
+
+    g_autoptr(GMutexLocker) store_locker = fsearch_database_index_store_get_locker(self->store);
+    g_assert_nonnull(store_locker);
+
+    signal_emit(self,
+                SIGNAL_SCAN_FINISHED,
+                database_get_info(self),
+                NULL,
+                1,
+                (GDestroyNotify)fsearch_database_info_unref,
+                NULL);
 }
 
 static void
@@ -575,8 +660,58 @@ database_scan(FsearchDatabase *self, FsearchDatabaseWork *work) {
         self);
     g_return_if_fail(store);
 
-    g_thread_pool_push(self->io_pool, g_steal_pointer(&store), NULL);
+    // The IO thread is expecting work objects -> use scan_finished kind to wrap the index store
+    g_autoptr(FsearchDatabaseWork) new_work = fsearch_database_work_new_scan_finished(
+        store,
+        (void *(*)(void *))fsearch_database_index_store_ref,
+        (GDestroyNotify)fsearch_database_index_store_unref);
 
+    g_thread_pool_push(self->io_pool, g_steal_pointer(&new_work), NULL);
+
+}
+
+static void
+database_rescan_indices_if_needed(FsearchDatabase *self) {
+    g_return_if_fail(self);
+    g_return_if_fail(self->store);
+
+    g_autoptr(FsearchDatabaseIncludeManager) include_manager =
+        fsearch_database_index_store_get_include_manager(self->store);
+    g_autoptr(GPtrArray) includes = fsearch_database_include_manager_get_includes(include_manager);
+
+    uint32_t num_active_monitored = 0;
+    uint32_t num_active = 0;
+    for (uint32_t i = 0; i < includes->len; i++) {
+        FsearchDatabaseInclude *include = g_ptr_array_index(includes, i);
+        if (fsearch_database_include_get_active(include)) {
+            num_active++;
+            if (fsearch_database_include_get_monitored(include)) {
+                num_active_monitored++;
+            }
+        }
+    }
+
+    // Don't rescan if there are no monitored indices
+    if (num_active_monitored == 0) {
+        return;
+    }
+
+    // If all indices are monitored, it's more efficient to rescan everything
+    if (num_active_monitored == num_active) {
+        g_debug("[db] all indices monitored, rescan everything.");
+        database_rescan(self);
+        return;
+    }
+
+    for (uint32_t i = 0; i < includes->len; i++) {
+        FsearchDatabaseInclude *include = g_ptr_array_index(includes, i);
+        if (fsearch_database_include_get_monitored(include) && fsearch_database_include_get_active(include)) {
+            g_debug("[db] rescan index: %s", fsearch_database_include_get_path(include));
+            g_autoptr(FsearchDatabaseWork) work = fsearch_database_work_new_rescan_index(
+                fsearch_database_include_get_id(include));
+            database_rescan_index(self, work);
+        }
+    }
 }
 
 static void
@@ -635,7 +770,7 @@ database_work_queue_thread(gpointer data) {
             break;
         case FSEARCH_DATABASE_WORK_LOAD_FROM_FILE:
             database_load(self);
-            database_rescan(self);
+            database_rescan_indices_if_needed(self);
             break;
         case FSEARCH_DATABASE_WORK_GET_ITEM_INFO: {
             FsearchDatabaseEntryInfo *info = NULL;
@@ -647,6 +782,12 @@ database_work_queue_thread(gpointer data) {
         }
         case FSEARCH_DATABASE_WORK_RESCAN:
             database_rescan(self);
+            break;
+        case FSEARCH_DATABASE_WORK_RESCAN_INDEX:
+            database_rescan_index(self, work);
+            break;
+        case FSEARCH_DATABASE_WORK_RESCAN_INDEX_FINISHED:
+            database_rescan_index_finished(self, work);
             break;
         case FSEARCH_DATABASE_WORK_SAVE_TO_FILE:
             signal_emit0(self, SIGNAL_SAVE_STARTED);
@@ -924,18 +1065,18 @@ fsearch_database_init(FsearchDatabase *self) {
     g_mutex_init(&self->mutex);
     self->cancellable = g_cancellable_new();
 #if GLIB_CHECK_VERSION(2, 70, 0)
-    self->io_pool = g_thread_pool_new_full(scan_thread_cb,
+    self->io_pool = g_thread_pool_new_full(io_thread_cb,
                                            self,
-                                           (GDestroyNotify)fsearch_database_index_store_unref,
+                                           (GDestroyNotify)fsearch_database_work_unref,
                                            1,
                                            TRUE,
                                            NULL);
 #else
-    self->io_pool = g_thread_pool_new(scan_thread_cb,
-                                           self,
-                                           1,
-                                           TRUE,
-                                           NULL);
+    self->io_pool = g_thread_pool_new(io_thread_cb,
+                                      self,
+                                      1,
+                                      TRUE,
+                                      NULL);
 #endif
     self->work_queue = g_async_queue_new_full((GDestroyNotify)fsearch_database_work_unref);
     self->work_queue_thread = g_thread_new("FsearchDatabaseWorkQueue", database_work_queue_thread, self);
