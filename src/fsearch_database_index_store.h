@@ -68,6 +68,14 @@ fsearch_database_index_store_start(FsearchDatabaseIndexStore *store, GCancellabl
 void
 fsearch_database_index_store_start_monitoring(FsearchDatabaseIndexStore *store);
 
+FsearchDatabaseIndex *
+fsearch_database_index_store_create_index_for_rescan(FsearchDatabaseIndexStore *store,
+                                                     uint32_t index_id);
+
+bool
+fsearch_database_index_store_replace_index(FsearchDatabaseIndexStore *store,
+                                           FsearchDatabaseIndex *new_index);
+
 // Getters
 FsearchDatabaseChunkedArray *
 fsearch_database_index_store_get_files(FsearchDatabaseIndexStore *store,

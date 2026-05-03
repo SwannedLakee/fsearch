@@ -14,6 +14,8 @@ typedef struct FsearchDatabaseWork FsearchDatabaseWork;
 typedef enum FsearchDatabaseWorkKind {
     FSEARCH_DATABASE_WORK_LOAD_FROM_FILE,
     FSEARCH_DATABASE_WORK_RESCAN,
+    FSEARCH_DATABASE_WORK_RESCAN_INDEX,
+    FSEARCH_DATABASE_WORK_RESCAN_INDEX_FINISHED,
     FSEARCH_DATABASE_WORK_SAVE_TO_FILE,
     FSEARCH_DATABASE_WORK_SCAN,
     FSEARCH_DATABASE_WORK_SCAN_FINISHED,
@@ -36,6 +38,18 @@ fsearch_database_work_new_quit(void);
 
 FsearchDatabaseWork *
 fsearch_database_work_new_rescan(void);
+
+FsearchDatabaseWork *
+fsearch_database_work_new_rescan_index(uint32_t index_id);
+
+FsearchDatabaseWork *
+fsearch_database_work_new_rescan_index_finished(FsearchDatabaseIndex *new_index);
+
+uint32_t
+fsearch_database_work_rescan_index_get_id(FsearchDatabaseWork *work);
+
+FsearchDatabaseIndex *
+fsearch_database_work_rescan_index_finished_get_index(FsearchDatabaseWork *work);
 
 FsearchDatabaseWork *
 fsearch_database_work_new_scan(FsearchDatabaseIncludeManager *include_manager,

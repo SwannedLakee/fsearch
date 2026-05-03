@@ -854,6 +854,107 @@ fsearch_database_index_store_start_monitoring(FsearchDatabaseIndexStore *store) 
     index_store_unlock_all_indices(store);
 }
 
+FsearchDatabaseIndex *
+fsearch_database_index_store_create_index_for_rescan(FsearchDatabaseIndexStore *store,
+                                                     uint32_t index_id) {
+    g_return_val_if_fail(store, NULL);
+
+    g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&store->mutex);
+    g_assert_nonnull(locker);
+
+    FsearchDatabaseIndex *old_index = NULL;
+    for (uint32_t i = 0; i < store->indices->len; i++) {
+        FsearchDatabaseIndex *idx = g_ptr_array_index(store->indices, i);
+        if (fsearch_database_index_get_id(idx) == index_id) {
+            old_index = idx;
+            break;
+        }
+    }
+
+    if (!old_index) {
+        g_warning("[index-store] create_index_for_rescan: no index with id %u", index_id);
+        return NULL;
+    }
+
+    g_autoptr(FsearchDatabaseInclude) include = fsearch_database_index_get_include(old_index);
+    g_autoptr(FsearchDatabaseExcludeManager) exclude_manager = fsearch_database_index_get_exclude_manager(old_index);
+    const FsearchDatabaseIndexPropertyFlags flags = fsearch_database_index_get_flags(old_index);
+
+    return fsearch_database_index_new(index_id,
+                                      include,
+                                      exclude_manager,
+                                      flags,
+                                      store->worker.ctx,
+                                      store->monitor.ctx,
+                                      index_store_index_event_cb,
+                                      store);
+}
+
+bool
+fsearch_database_index_store_replace_index(FsearchDatabaseIndexStore *store,
+                                           FsearchDatabaseIndex *new_index) {
+    g_return_val_if_fail(store, false);
+    g_return_val_if_fail(new_index, false);
+
+    g_autoptr(GMutexLocker) locker = g_mutex_locker_new(&store->mutex);
+    g_assert_nonnull(locker);
+
+    const uint32_t index_id = fsearch_database_index_get_id(new_index);
+
+    // Find the old index.
+    int32_t old_idx_pos = -1;
+    for (uint32_t i = 0; i < store->indices->len; i++) {
+        FsearchDatabaseIndex *idx = g_ptr_array_index(store->indices, i);
+        if (fsearch_database_index_get_id(idx) == index_id) {
+            old_idx_pos = i;
+            break;
+        }
+    }
+
+    if (old_idx_pos < 0) {
+        g_warning("[index-store] replace_index: no index with id %u", index_id);
+        return false;
+    }
+
+    g_autoptr(FsearchDatabaseIndex) old_index = g_ptr_array_steal_index(store->indices, old_idx_pos);
+
+    // 1. Stop monitoring on the old index so no new filesystem events are queued.
+    fsearch_database_index_start_monitoring(old_index, false);
+
+    // 2. Remove the old index
+    fsearch_database_index_lock(old_index);
+
+    g_autoptr(DynamicArray) old_files = fsearch_database_index_get_files(old_index);
+    g_autoptr(DynamicArray) old_folders = fsearch_database_index_get_folders(old_index);
+    index_store_remove_entries_locked(store, old_files, old_folders);
+
+    fsearch_database_index_unlock(old_index);
+
+    // 4. Add the new index
+    g_ptr_array_add(store->indices, fsearch_database_index_ref(new_index));
+
+    fsearch_database_index_lock(new_index);
+    g_autoptr(DynamicArray) new_files = fsearch_database_index_get_files(new_index);
+    g_autoptr(DynamicArray) new_folders = fsearch_database_index_get_folders(new_index);
+    index_store_add_entries_locked(store, new_files, new_folders);
+    fsearch_database_index_unlock(new_index);
+
+    // 5. Enable monitoring on the new index.
+    fsearch_database_index_start_monitoring(new_index, true);
+
+    // 6. Notify any open search views that their results may have changed.
+    index_store_update_all_search_views_locked(store);
+
+    if (store->event_func) {
+        store->event_func(store,
+                          FSEARCH_DATABASE_INDEX_STORE_EVENT_CONTENT_CHANGED,
+                          NULL,
+                          store->event_func_data);
+    }
+
+    return true;
+}
+
 GMutexLocker *
 fsearch_database_index_store_get_locker(FsearchDatabaseIndexStore *store) {
     g_return_val_if_fail(store, NULL);
